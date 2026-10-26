@@ -9,7 +9,43 @@ import collections
 import sys
 import subprocess
 import os
+import re
 import warnings
+
+# FastChem Python bindings (pip install pyfastchem). Optional: if missing,
+# LavAtmos2 falls back to running the FastChem executable through files.
+try:
+    import pyfastchem
+except ImportError:
+    pyfastchem = None
+
+# Boltzmann constant in erg/K (cgs), as used by FastChem
+K_BOLTZMANN_CGS = 1.380649e-16
+
+
+class suppress_c_stdout:
+    '''
+    Silences output written straight to the stdout file descriptor by
+    compiled code (e.g. FastChem's C++ std::cout), which Python's
+    contextlib.redirect_stdout cannot catch. Works in scripts and Jupyter.
+    '''
+    def __enter__(self):
+        sys.stdout.flush()
+        self._fd = 1
+        self._saved = os.dup(self._fd)
+        self._null = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(self._null, self._fd)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        os.dup2(self._saved, self._fd)
+        os.close(self._saved)
+        os.close(self._null)
+        return False
 
 # Thermoengine modules
 from thermoengine import equilibrate 
@@ -29,8 +65,38 @@ class melt_vapor_system:
     thermo data.
     '''
 
-    def __init__(self, paths=None):
-        
+    def __init__(self, paths=None, use_pyfastchem=True,
+                 fastchem_species_file='input/logK/logK.dat',
+                 fastchem_parameters=None):
+        '''
+        use_pyfastchem : bool
+            If True (default), FastChem is called in memory through its
+            Python bindings, which is much faster. If False, the original
+            route (writing input files and running the FastChem executable)
+            is used. Useful for checking that both give the same answer.
+
+        fastchem_species_file : str
+            Gas-phase species data (logK) file, relative to fastchem_dir.
+            Must be the same file your FastChem config points to.
+
+        fastchem_parameters : dict or None
+            FastChem settings, using pyfastchem's parameter names. None uses
+            the values in data/fastchem_files/config_template.input
+            (accuracy 1e-6, 150000 chemistry / 100000 solver iterations),
+            mapped the way the FastChem executable maps them. If you change
+            the config template, change these to match.
+        '''
+        if fastchem_parameters is None:
+            fastchem_parameters = {
+                'accuracyChem': 1.0e-6,
+                'accuracyElementConservation': 1.0e-6,
+                'accuracyNewton': 1.0e-6,       # executable sets this = accuracyChem
+                'nbIterationsChem': 150000,
+                'nbIterationsNewton': 100000,   # "internal solver iterations"
+                'nbIterationsNelderMead': 100000,
+                'nbIterationsBisection': 100000,
+            }
+
         
         # Constants
         self._R = 8.314
@@ -141,6 +207,11 @@ class melt_vapor_system:
                         'V' : 3.93,
                         'Zn' : 4.56
                         }
+
+        # Load FastChem once, in memory, instead of launching it per call
+        self.use_pyfastchem = use_pyfastchem
+        if self.use_pyfastchem:
+            self._init_pyfastchem(fastchem_species_file, fastchem_parameters)
 
     def vaporise(self, T, P_volatile, melt_comp, volatile_comp, P_melt = 0.01,\
                           fO2_initial_guess = 1e-10,\
@@ -603,10 +674,15 @@ class melt_vapor_system:
         O_abun = O_abun[0]
         # print('O abun in calulcate fastchem pressure function:', O_abun)
         self.calculate_fastchem_abundance(O_abun, vapor_partial_pressures, P_boa, volatile_comp)
-        self.edit_fastchem_configs(T,P_boa)
-        self.run_fastchem()
 
-        fastchem_partial_pressures = self.read_fastchem_partial_pressures()
+        if self.use_pyfastchem:
+            # In memory: no files, no new process
+            fastchem_partial_pressures = self.run_pyfastchem(T, P_boa)
+        else:
+            # Original route: write input files, run executable, read output
+            self.edit_fastchem_configs(T,P_boa)
+            self.run_fastchem()
+            fastchem_partial_pressures = self.read_fastchem_partial_pressures()
         
         # print(f'fO2: {fastchem_partial_pressures["O2"].iloc[0]:.6e}')
 
@@ -700,6 +776,23 @@ class melt_vapor_system:
                 print(fracN[el])
 
 
+        # Set abundances to outgassed abundances (log scale, 12 + log10)
+        self.log_abundances = {}
+        for el in self.all_elements:
+            if el in self.vaporised_elements or el in volatile_comp and fracN[el] != 0:
+                abund = 12 + np.log10(fracN[el]*1e20)
+
+                if self.is_iterable(abund):
+                    abund = abund[0]
+            else:
+                # abund = self.solar_abundance[el]
+                abund = 0
+            self.log_abundances[el] = abund
+
+        # The in-memory route uses self.log_abundances directly; no file needed
+        if self.use_pyfastchem:
+            return P_boa
+
         # Open abundance file template
         # TODO: Consider not hardcoding this (moving to paths file)
         template_name = 'element_abundances_template.dat'
@@ -711,20 +804,9 @@ class melt_vapor_system:
         elab_file = template.read()
         template.close()
 
-        # Set abundances to outgassed abundances
         for el in self.all_elements:
-            if el in self.vaporised_elements or el in volatile_comp and fracN[el] != 0:
-                abund = 12 + np.log10(fracN[el]*1e20)
+            elab_file = elab_file.replace(f'<<{el}>>', str(self.log_abundances[el]))
 
-                if self.is_iterable(abund):
-                    abund = abund[0]
-                
-                elab_file = elab_file.replace(f'<<{el}>>', str(abund))
-            else:
-                # abund = self.solar_abundance[el]
-                abund = 0
-                elab_file = elab_file.replace(f'<<{el}>>', str(abund))
-        
         # Save abundance file
         self.abundance_fname = self.abundances_location+output_name
         g = open(self.abundance_fname, 'w')
@@ -1001,6 +1083,100 @@ class melt_vapor_system:
         fastchem_partial_pressures = pd.read_csv(fname, sep=r'\s+')
         return fastchem_partial_pressures.drop(columns=self.fastchem_column_names)\
                *fastchem_partial_pressures[self.fastchem_column_names[0]].iloc[0]
+
+    def _init_pyfastchem(self, species_file, parameters):
+        '''
+        Loads FastChem in memory once. Reading the species data is the slow
+        part of starting FastChem, so doing it once here (instead of on
+        every call) is where most of the speed-up comes from.
+        '''
+        if pyfastchem is None:
+            raise ImportError('pyfastchem is not installed. Install it with '
+                              '"pip install pyfastchem", or pass '
+                              'use_pyfastchem=False to use the FastChem '
+                              'executable instead.')
+
+        # Build an abundance file with the same element list as the
+        # template, so FastChem loads exactly the same elements (and
+        # therefore the same species) as the file-based route.
+        template_path = self.abundances_location+'element_abundances_template.dat'
+        with open(template_path) as f:
+            template = f.read()
+        init_path = self.abundances_location+'element_abundances_pyfastchem_init.dat'
+        with open(init_path, 'w') as f:
+            f.write(re.sub(r'<<[^>]+>>', '0', template))
+
+        if os.path.isabs(species_file):
+            species_path = species_file
+        else:
+            species_path = os.path.join(self.fastchem_dir, species_file)
+        if not os.path.exists(species_path):
+            raise FileNotFoundError(f'FastChem species file not found: {species_path}')
+
+        # FastChem prints a "Stoichiometry of species ... incomplete.
+        # Neglected!" line for every species containing an element not in
+        # the abundance template (Cr, Co, Ni, ...). These are harmless (the
+        # executable printed them too, hidden by stdout=DEVNULL), but they
+        # come from C++ and ignore the verbose level, so hide them here.
+        with suppress_c_stdout():
+            self.fastchem = pyfastchem.FastChem(init_path, species_path, 0)
+        if self.fastchem.getGasSpeciesNumber() == 0:
+            raise RuntimeError('FastChem failed to initialise. Check the '
+                               f'abundance file {init_path} and species '
+                               f'file {species_path}.')
+
+        for name, value in (parameters or {}).items():
+            if not self.fastchem.setParameter(name, value):
+                raise ValueError(f'FastChem rejected parameter {name}={value!r}. '
+                                 'Accuracies must be floats (1e-5, not 1), '
+                                 'iteration counts ints.')
+
+        # Elements whose abundance LavAtmos2 sets (those with a <<el>>
+        # placeholder in the template); others keep their template value
+        self.fc_element_index = {}
+        for el in self.all_elements:
+            idx = self.fastchem.getElementIndex(el)
+            if f'<<{el}>>' in template and idx != pyfastchem.FASTCHEM_UNKNOWN_SPECIES:
+                self.fc_element_index[el] = idx
+        self.fc_base_abundances = np.array(self.fastchem.getElementAbundances())
+
+        # Column names match the header of FastChem's output file
+        self.fc_species_symbols = [self.fastchem.getGasSpeciesSymbol(i)
+                                   for i in range(self.fastchem.getGasSpeciesNumber())]
+
+    def run_pyfastchem(self, T, P):
+        '''
+        In-memory replacement for edit_fastchem_configs + run_fastchem +
+        read_fastchem_partial_pressures. Uses the abundances set by
+        calculate_fastchem_abundance and returns partial pressures (bar) as
+        a one-row DataFrame with the same columns as before.
+        '''
+        T = float(np.ravel(T)[0])
+        P = float(np.ravel(P)[0])
+
+        abundances = self.fc_base_abundances.copy()
+        for el, idx in self.fc_element_index.items():
+            abundances[idx] = 10.0**(float(np.ravel(self.log_abundances[el])[0]) - 12.0)
+        self.fastchem.setElementAbundances(abundances.tolist())
+
+        fc_input = pyfastchem.FastChemInput()
+        fc_input.temperature = [T]
+        fc_input.pressure = [P]
+        fc_output = pyfastchem.FastChemOutput()
+
+        flag = self.fastchem.calcDensities(fc_input, fc_output)
+        if flag in (pyfastchem.FASTCHEM_INITIALIZATION_FAILED,
+                    pyfastchem.FASTCHEM_WRONG_INPUT_VALUES):
+            raise RuntimeError(f'FastChem failed: {pyfastchem.FASTCHEM_MSG[flag]}')
+        self.fastchem_flag = flag  # e.g. FASTCHEM_NO_CONVERGENCE, as before not fatal
+
+        # Mixing ratio = n_i / n_gas with n_gas = P/(k T), as in the output file
+        number_densities = np.array(fc_output.number_densities[0])
+        n_gas = P*1e6/(K_BOLTZMANN_CGS*T)
+        partial_pressures = number_densities/n_gas*P
+
+        # Build from a 2-D array (fast) rather than a list of rows (slow)
+        return pd.DataFrame(partial_pressures[np.newaxis, :], columns=self.fc_species_symbols)
 
     def is_iterable(self,variable):
         try:
