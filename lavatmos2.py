@@ -70,7 +70,7 @@ class melt_vapor_system:
         # self.abundances_location = paths.element_abundances3
 
         # For if LavAtmos2 is standalone
-        self.fastchem_dir = 'FastChem/' 
+        self.fastchem_dir = '/Users/mcgintya/Documents/Python_scripts/fastchem/' 
         self.abundances_location = self.fastchem_dir+'input/element_abundances/' 
         self.fastchem_column_names = ['#p(bar)','T(K)','n_<tot>(cm-3)','n_g(cm-3)','m(u)']
 
@@ -946,7 +946,7 @@ class melt_vapor_system:
             'param_path' : param_path,
             'tp_grid_path' : tp_point_path, 
             'output_abundance_fname' : 'output/boa_chem.dat',
-            'element_abundance_file' : self.abundance_fname.replace('FastChem/','')
+            'element_abundance_file' : os.path.relpath(self.abundance_fname, self.fastchem_dir)
             }
         for config in fastchem_config:
             configurations = configurations.replace(f'<<{config}>>', fastchem_config[config])
